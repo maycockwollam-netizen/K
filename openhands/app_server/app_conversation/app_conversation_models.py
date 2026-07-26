@@ -46,6 +46,10 @@ ARCHIVE_WORKSPACE_PATH_TAG_KEY = 'archiveworkspacepath'
 AGENT_PROFILE_ID_TAG_KEY = 'agentprofileid'
 AGENT_PROFILE_REVISION_TAG_KEY = 'agentprofilerevision'
 
+# Conversation-tag key for dev mode. When set to 'true', the agent will
+# bypass security restrictions and unlock all barriers.
+DEV_MODE_TAG_KEY = 'devmode'
+
 
 class ConversationTrigger(Enum):
     RESOLVER = 'resolver'

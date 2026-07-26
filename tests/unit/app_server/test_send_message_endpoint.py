@@ -5,6 +5,7 @@ This module tests the send-message endpoint, focusing on:
 - Requiring sandbox to be in RUNNING state
 - Agent server communication
 - Error handling
+- Dev mode trigger detection
 """
 
 from unittest.mock import AsyncMock, MagicMock
@@ -18,6 +19,7 @@ from openhands.agent_server.models import TextContent
 from openhands.app_server.app_conversation.app_conversation_models import (
     AppConversation,
     AppSendMessageRequest,
+    DEV_MODE_TAG_KEY,
 )
 from openhands.app_server.app_conversation.app_conversation_router import (
     send_message_to_conversation,
@@ -75,6 +77,7 @@ def _make_mock_conversation_service(conversation=None):
     """Create a mock AppConversationService for testing."""
     service = MagicMock()
     service.get_app_conversation = AsyncMock(return_value=conversation)
+    service.update_app_conversation = AsyncMock(return_value=None)
     return service
 
 
@@ -533,3 +536,253 @@ class TestAppSendMessageRequestValidation:
             ]
         )
         assert len(request.content) == 2
+
+
+@pytest.mark.asyncio
+class TestDevModeTrigger:
+    """Test suite for dev mode trigger detection."""
+
+    async def test_dev_mode_triggered_when_dev_in_message(self):
+        """Test that dev mode is triggered when 'dev' is in the message.
+
+        Arrange: Create running conversation with no dev mode
+        Act: Send message containing 'dev'
+        Assert: Dev mode is enabled, header added, and instruction injected
+        """
+        # Arrange
+        conversation_id = uuid4()
+        sandbox_id = str(uuid4())
+        conversation = _make_mock_conversation(
+            conversation_id=conversation_id, sandbox_id=sandbox_id
+        )
+        conversation.tags = {}  # No dev mode initially
+        sandbox = _make_mock_sandbox(sandbox_id=sandbox_id)
+        request = AppSendMessageRequest(
+            content=[TextContent(text='Hello dev, please help me')],
+            run=True,
+        )
+
+        mock_conversation_service = _make_mock_conversation_service(conversation)
+        mock_sandbox_service = _make_mock_sandbox_service(sandbox)
+        mock_httpx_client = _make_mock_httpx_client()
+
+        # Act
+        result = await send_message_to_conversation(
+            conversation_id=conversation_id,
+            request=request,
+            app_conversation_service=mock_conversation_service,
+            sandbox_service=mock_sandbox_service,
+            httpx_client=mock_httpx_client,
+        )
+
+        # Assert
+        assert result.success is True
+        assert result.message == '🛡️ Dev mode activated'
+        mock_conversation_service.update_app_conversation.assert_called_once()
+        call_kwargs = mock_conversation_service.update_app_conversation.call_args
+        assert call_kwargs.kwargs['tags'][DEV_MODE_TAG_KEY] == 'true'
+
+        # Check X-Dev-Mode header and instruction injection
+        http_call = mock_httpx_client.post.call_args
+        assert http_call.kwargs['headers']['X-Dev-Mode'] == 'true'
+        content = http_call.kwargs['json']['content']
+        assert any('DEV MODE ENABLED' in str(item.get('text', '')) for item in content)
+
+    async def test_dev_mode_triggered_case_insensitive(self):
+        """Test that dev mode is triggered regardless of case.
+
+        Arrange: Create running conversation
+        Act: Send message with 'DEV' in uppercase
+        Assert: Dev mode is activated
+        """
+        # Arrange
+        conversation_id = uuid4()
+        sandbox_id = str(uuid4())
+        conversation = _make_mock_conversation(
+            conversation_id=conversation_id, sandbox_id=sandbox_id
+        )
+        conversation.tags = {}
+        sandbox = _make_mock_sandbox(sandbox_id=sandbox_id)
+        request = AppSendMessageRequest(
+            content=[TextContent(text='Please work in DEV mode')],
+            run=True,
+        )
+
+        mock_conversation_service = _make_mock_conversation_service(conversation)
+        mock_sandbox_service = _make_mock_sandbox_service(sandbox)
+        mock_httpx_client = _make_mock_httpx_client()
+
+        # Act
+        result = await send_message_to_conversation(
+            conversation_id=conversation_id,
+            request=request,
+            app_conversation_service=mock_conversation_service,
+            sandbox_service=mock_sandbox_service,
+            httpx_client=mock_httpx_client,
+        )
+
+        # Assert
+        assert result.message == '🛡️ Dev mode activated'
+
+    async def test_dev_mode_not_triggered_without_dev_keyword(self):
+        """Test that dev mode is not triggered when 'dev' is not in message.
+
+        Arrange: Create running conversation
+        Act: Send normal message without 'dev'
+        Assert: Dev mode is not enabled, no confirmation message, no header
+        """
+        # Arrange
+        conversation_id = uuid4()
+        sandbox_id = str(uuid4())
+        conversation = _make_mock_conversation(
+            conversation_id=conversation_id, sandbox_id=sandbox_id
+        )
+        sandbox = _make_mock_sandbox(sandbox_id=sandbox_id)
+        request = AppSendMessageRequest(
+            content=[TextContent(text='Hello, please help me with my code')],
+            run=True,
+        )
+
+        mock_conversation_service = _make_mock_conversation_service(conversation)
+        mock_sandbox_service = _make_mock_sandbox_service(sandbox)
+        mock_httpx_client = _make_mock_httpx_client()
+
+        # Act
+        result = await send_message_to_conversation(
+            conversation_id=conversation_id,
+            request=request,
+            app_conversation_service=mock_conversation_service,
+            sandbox_service=mock_sandbox_service,
+            httpx_client=mock_httpx_client,
+        )
+
+        # Assert
+        assert result.success is True
+        assert result.message is None
+        mock_conversation_service.update_app_conversation.assert_not_called()
+        # No X-Dev-Mode header when dev mode not enabled
+        http_call = mock_httpx_client.post.call_args
+        assert 'X-Dev-Mode' not in http_call.kwargs['headers']
+
+    async def test_dev_mode_sends_header_when_already_enabled(self):
+        """Test that X-Dev-Mode header is sent when dev mode is already enabled.
+
+        Arrange: Create conversation with dev mode already enabled
+        Act: Send normal message
+        Assert: X-Dev-Mode header is sent, instruction injected, but no re-trigger
+        """
+        # Arrange
+        conversation_id = uuid4()
+        sandbox_id = str(uuid4())
+        conversation = _make_mock_conversation(
+            conversation_id=conversation_id, sandbox_id=sandbox_id
+        )
+        conversation.tags = {DEV_MODE_TAG_KEY: 'true'}  # Already enabled
+        sandbox = _make_mock_sandbox(sandbox_id=sandbox_id)
+        request = AppSendMessageRequest(
+            content=[TextContent(text='continue working')],
+            run=True,
+        )
+
+        mock_conversation_service = _make_mock_conversation_service(conversation)
+        mock_sandbox_service = _make_mock_sandbox_service(sandbox)
+        mock_httpx_client = _make_mock_httpx_client()
+
+        # Act
+        result = await send_message_to_conversation(
+            conversation_id=conversation_id,
+            request=request,
+            app_conversation_service=mock_conversation_service,
+            httpx_client=mock_httpx_client,
+            sandbox_service=mock_sandbox_service,
+        )
+
+        # Assert
+        assert result.success is True
+        assert result.message is None  # Not triggered again
+        mock_conversation_service.update_app_conversation.assert_not_called()
+
+        # X-Dev-Mode header should still be sent
+        http_call = mock_httpx_client.post.call_args
+        assert http_call.kwargs['headers']['X-Dev-Mode'] == 'true'
+        content = http_call.kwargs['json']['content']
+        assert any('DEV MODE ENABLED' in str(item.get('text', '')) for item in content)
+
+    async def test_dev_stripped_from_message_content(self):
+        """Test that 'dev' is removed from the message content sent to agent.
+
+        Arrange: Create running conversation
+        Act: Send message containing 'dev'
+        Assert: The message sent to agent server does not contain standalone 'dev'
+        """
+        # Arrange
+        conversation_id = uuid4()
+        sandbox_id = str(uuid4())
+        conversation = _make_mock_conversation(
+            conversation_id=conversation_id, sandbox_id=sandbox_id
+        )
+        conversation.tags = {}
+        sandbox = _make_mock_sandbox(sandbox_id=sandbox_id)
+        request = AppSendMessageRequest(
+            content=[TextContent(text='dev please fix this bug')],
+            run=True,
+        )
+
+        mock_conversation_service = _make_mock_conversation_service(conversation)
+        mock_sandbox_service = _make_mock_sandbox_service(sandbox)
+        mock_httpx_client = _make_mock_httpx_client()
+
+        # Act
+        await send_message_to_conversation(
+            conversation_id=conversation_id,
+            request=request,
+            app_conversation_service=mock_conversation_service,
+            sandbox_service=mock_sandbox_service,
+            httpx_client=mock_httpx_client,
+        )
+
+        # Assert
+        http_call = mock_httpx_client.post.call_args
+        json_payload = http_call.kwargs['json']
+        # 'dev' should be stripped from user content (but may appear in instruction)
+        user_content = json_payload['content'][0]['text']
+        assert 'please fix this bug' in user_content
+        # Standalone 'dev' should be stripped
+        import re
+        assert not re.search(r'\bdev\b', user_content.replace('DEV MODE', ''))
+
+    async def test_dev_standalone_word_only(self):
+        """Test that 'develop' does not trigger dev mode (only standalone 'dev').
+
+        Arrange: Create running conversation
+        Act: Send message with 'develop' but not standalone 'dev'
+        Assert: Dev mode is not triggered
+        """
+        # Arrange
+        conversation_id = uuid4()
+        sandbox_id = str(uuid4())
+        conversation = _make_mock_conversation(
+            conversation_id=conversation_id, sandbox_id=sandbox_id
+        )
+        sandbox = _make_mock_sandbox(sandbox_id=sandbox_id)
+        request = AppSendMessageRequest(
+            content=[TextContent(text='Please develop this feature for me')],
+            run=True,
+        )
+
+        mock_conversation_service = _make_mock_conversation_service(conversation)
+        mock_sandbox_service = _make_mock_sandbox_service(sandbox)
+        mock_httpx_client = _make_mock_httpx_client()
+
+        # Act
+        result = await send_message_to_conversation(
+            conversation_id=conversation_id,
+            request=request,
+            app_conversation_service=mock_conversation_service,
+            sandbox_service=mock_sandbox_service,
+            httpx_client=mock_httpx_client,
+        )
+
+        # Assert
+        assert result.message is None
+        mock_conversation_service.update_app_conversation.assert_not_called()
