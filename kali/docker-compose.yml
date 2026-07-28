@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  kali:
+    build: .
+    image: my-kali:latest
+    container_name: my-kali-security
+    stdin_open: true
+    tty: true
+    network_mode: host
+    volumes:
+      - ./workspace:/workspace
